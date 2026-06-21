@@ -1,0 +1,8 @@
+{
+  "name": "freeman-browser",
+  "version": "1.1.0",
+  "description": "Stealth browser automation for AI agents. Bypasses anti-bot detection with human-like fingerprints.",
+  "author": "freeman",
+  "license": "MIT",
+  "keywords": ["browser", "stealth", "playwright", "anti-detection", "automation"]
+}
