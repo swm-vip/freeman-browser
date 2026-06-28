@@ -53,6 +53,32 @@ try {
   console.warn('[freeman-browser] Could not load browser.json:', e.message);
 }
 
+// ─── CHROME VERSION DETECTION ─────────────────────────────────────────────────
+
+let CHROME_VERSION = '136.0.0.0';
+let CHROME_MAJOR = '136';
+
+async function detectChromeVersion() {
+  try {
+    // Try to get the actual Chromium version from Playwright
+    const browser = await chromium.launch({ headless: true });
+    const version = browser.version(); // e.g., "136.0.7103.49 (Chromium)"
+    await browser.close();
+    
+    const match = version.match(/Chromium\s+(\d+)\./);
+    if (match) {
+      CHROME_MAJOR = match[1];
+      CHROME_VERSION = `${CHROME_MAJOR}.0.0.0`;
+      console.log(`[freeman-browser] Detected Chromium ${CHROME_MAJOR}`);
+    }
+  } catch (err) {
+    console.warn(`[freeman-browser] Could not detect Chromium version, using default ${CHROME_MAJOR}:`, err.message);
+  }
+}
+
+// Detect version on module load (non-blocking)
+detectChromeVersion().catch(() => {});
+
 // ─── DEVICE PROFILES ─────────────────────────────────────────────────────────
 
 function buildDevice(mobile) {
@@ -60,9 +86,6 @@ function buildDevice(mobile) {
   const timezoneId = userConfig.timezoneId || 'America/New_York';
   const geolocation = userConfig.geolocation || { latitude: 40.7128, longitude: -74.006, accuracy: 50 };
   const acceptLanguage = locale + (locale === 'en-US' ? ',en;q=0.9' : ',en-US;q=0.9,en;q=0.8');
-
-  const CHROME_VERSION = '136.0.0.0';
-  const CHROME_MAJOR = '136';
 
   if (mobile) {
     return {
@@ -162,16 +185,21 @@ async function detectSliderCaptcha(page) {
     }
 
     // Check for specific slider styles (width-based detection)
+    // Only flag elements that are unambiguously sliders to reduce false positives
     const allElements = document.querySelectorAll('*');
     let styleMatch = false;
     for (const el of allElements) {
       const style = window.getComputedStyle(el);
-      if (style.cursor === 'move' || style.cursor === 'grab' || style.cursor === 'grabbing') {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 200 && rect.height < 100) {
-          styleMatch = true;
-          break;
-        }
+      const rect = el.getBoundingClientRect();
+      // Must have move cursor AND be wide/narrow AND have visible background
+      const hasMoveCursor = style.cursor === 'move' || style.cursor === 'grab' || style.cursor === 'grabbing';
+      const isWideAndShort = rect.width > 200 && rect.height > 20 && rect.height < 80;
+      const hasVisibleBg = style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent' && style.backgroundColor !== 'rgba(0,0,0,0)';
+      // Also check for slider-related border-radius or overflow hidden
+      const hasSliderStyle = style.borderRadius === '4px' || style.overflow === 'hidden' || style.overflowX === 'hidden';
+      if (hasMoveCursor && isWideAndShort && (hasVisibleBg || hasSliderStyle)) {
+        styleMatch = true;
+        break;
       }
     }
 
@@ -319,46 +347,49 @@ async function solveSliderCaptcha(page, opts = {}) {
 
       // Calculate the distance to drag
       const distance = endX - startX;
-      const steps = rand(20, 40);
+      const steps = rand(30, 50);
 
-      // Human-like drag with acceleration and deceleration
-      // Add random pauses and speed variations
+      // Dynamic Bezier parameters based on drag distance
+      // Short drags: flatter curve, less overshoot
+      // Long drags: steeper curve, more natural acceleration profile
+      const absDist = Math.abs(distance);
+      const cp1x = absDist * (0.2 + Math.random() * 0.15);  // First control point X (20-35% of distance)
+      const cp1y = (Math.random() - 0.5) * 20;              // First control point Y (slight vertical drift)
+      const cp2x = absDist * (0.7 + Math.random() * 0.2);   // Second control point X (70-90% of distance)
+      const cp2y = (Math.random() - 0.5) * 25;              // Second control point Y (more vertical drift at end)
+
+      // Cubic Bezier evaluation
+      function cubicBezier(t, p0, p1, p2, p3) {
+        const mt = 1 - t;
+        return mt*mt*mt*p0 + 3*mt*mt*t*p1 + 3*mt*t*t*p2 + t*t*t*p3;
+      }
+
+      // Human-like drag with acceleration and deceleration using dynamic Bezier
       for (let i = 0; i <= steps; i++) {
         const t = i / steps;
-        
-        // Easing function: accelerate then decelerate with more natural curve
-        let easedT;
-        if (t < 0.3) {
-          // Slow start with acceleration
-          easedT = t * t * 3.33;
-        } else if (t < 0.7) {
-          // Fast middle section
-          easedT = 0.3 + (t - 0.3) * 1.75;
-        } else {
-          // Slow down at end
-          const remaining = (t - 0.7) / 0.3;
-          easedT = 0.7 + remaining * (1.7 - remaining * 0.7) * 0.3;
-        }
-        
-        const currentX = startX + distance * easedT + rand(-5, 5);
-        const currentY = startY + rand(-3, 3);
+
+        // Use Bezier curve for smooth acceleration/deceleration
+        const easedT = cubicBezier(t, 0, cp1x / absDist, cp2x / absDist, 1);
+        const currentX = startX + distance * easedT + rand(-3, 3);
+        const currentY = startY + cubicBezier(t, 0, cp1y / 30, cp2y / 30, 0) * 3 + rand(-2, 2);
         await page.mouse.move(currentX, currentY);
-        
+
         // Variable delay with occasional pauses
         let delay;
-        if (t < 0.1 || t > 0.9) {
-          delay = rand(30, 60); // Slower at edges
-        } else if (t < 0.3 || t > 0.7) {
-          delay = rand(15, 35); // Medium speed
+        const speed = Math.abs(easedT - (i > 0 ? cubicBezier((i-1)/steps, 0, cp1x/absDist, cp2x/absDist, 1) : 0));
+        if (speed < 0.02) {
+          delay = rand(40, 80); // Slower at inflection points
+        } else if (t < 0.15 || t > 0.85) {
+          delay = rand(25, 50); // Slower at edges
         } else {
-          delay = rand(8, 20); // Fast in middle
+          delay = rand(10, 25); // Fast in middle
         }
-        
-        // Random pause (5% chance)
-        if (Math.random() < 0.05) {
-          delay += rand(100, 300);
+
+        // Random pause (3% chance)
+        if (Math.random() < 0.03) {
+          delay += rand(80, 200);
         }
-        
+
         await sleep(delay);
       }
 
@@ -668,10 +699,8 @@ async function launchFreeman(opts = {}) {
     }
   }
 
-  if (browserPath) {
-    console.log('[freeman-browser] Using existing browser:', browserPath);
-  }
-
+  // Enhanced Chromium args for better stealth and stability
+  const BLOCKED_RESOURCE_TYPES = ['image', 'media', 'font']; // block by default, override per-site
   const browser = await chromium.launch({
     headless,
     executablePath: browserPath,
@@ -682,6 +711,54 @@ async function launchFreeman(opts = {}) {
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',
       '--disable-web-security',
+      '--disable-component-update',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync',
+      '--disable-translate',
+      '--hide-scrollbars',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--safebrowsing-disable-auto-update',
+      '--disable-popup-blocking',
+      '--disable-prompt-on-repost',
+      '--disable-client-side-phishing-detection',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-infobars',
+      '--disable-session-crashed-bubble',
+      '--disable-smooth-scrolling',
+      '--disable-print-preview',
+      '--disable-speech-api',
+      '--disable-voice-input',
+      '--disable-wake-on-wifi',
+      '--disable-cast',
+      '--disable-hang-monitor',
+      '--disable-delay-unsupported-metrics-reporting',
+      '--disable-domain-reliability',
+      '--disable-features=AudioServiceOutOfProcess',
+      '--disable-logging',
+      '--disable-message-center-alerts',
+      '--disable-metrics-reporting',
+      '--disable-notifications',
+      '--disable-password-generation',
+      '--disable-password-manager-reauthentication',
+      '--disable-permission-event-reporting',
+      '--disable-presentation-api',
+      '--disable-remote-fonts',
+      '--disable-screen-capture',
+      '--disable-share',
+      '--disable-speech-dispatcher',
+      '--disable-spellchecking',
+      '--disable-subscription-messaging',
+      '--disable-system-font-check',
+      '--disable-threaded-animation',
+      '--disable-threaded-scrolling',
+      '--disable-url-keyed-animated-content',
+      '--disable-usb-keyboard-detect',
+      '--disable-windows10-custom-titlebar',
+      '--disable-xss-auditor',
+      '--dns-over-https-templates=https://dns.google/dns-query,https://cloudflare-dns.com/dns-query',
     ],
   });
 
@@ -689,9 +766,56 @@ async function launchFreeman(opts = {}) {
     ...device,
     ignoreHTTPSErrors: true,
     permissions: ['geolocation', 'notifications'],
+    proxy: userConfig.proxy ? {
+      server: userConfig.proxy.server,
+      bypass: userConfig.proxy.bypass || [],
+      username: userConfig.proxy.username,
+      password: userConfig.proxy.password,
+    } : undefined,
   };
 
   const ctx = await browser.newContext(ctxOpts);
+
+  // Route to block trackers, ads, and unnecessary resources
+  const TRACKER_DOMAINS = [
+    'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+    'googletagmanager.com', 'googletagservices.com', 'google-analytics.com',
+    'googleanalytics.com', 'googleoptimize.com', 'facebook.com/tr',
+    'connect.facebook.net', 'pixel.facebook.com', 'analytics.twitter.com',
+    'static.hotjar.com', 'static.ads-twitter.com', 'ads.twitter.com',
+    'bat.bing.com', 'c.bing.com', 'snap.licdn.com', 'ads.linkedin.com',
+    'analytics.linkedin.com', 'pixel.tapad.com', 'pixel.rubiconproject.com',
+    'ads.rubiconproject.com', 'cm.g.doubleclick.net',
+    'securepubads.g.doubleclick.net', 'pagead2.googlesyndication.com',
+    'tpc.googlesyndication.com', 'syndication.twitter.com',
+    'platform.twitter.com', 'static.adsafeprotected.com', 'fw.adsafeprotected.com',
+    'js-agent.newrelic.com', 'bam.nr-data.net', 'nr-data.net',
+    'sc.analytics.yahoo.com', 'analytics.yahoo.com', 'pixel.tree.com',
+    'pixel.advertising.com', 'ads.pubmatic.com', 'ads.yahoo.com',
+    'adservice.google.com', 'adservice.google.com',
+    'static.criteo.net', 'static.criteo.com', 'bidgear.com',
+    'moatads.com', 'adsafeprotected.com', 'imasdk.googleapis.com',
+    'imasdk.cdn.fireeye.com', 'analytics.srvtrk.com',
+  ];
+
+  await ctx.route('**/*', async (route, request) => {
+    const url = request.url();
+    const resourceType = request.resourceType();
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      const isTracker = TRACKER_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d));
+      if (isTracker) {
+        return route.abort();
+      }
+      // Block fonts/media by default for stealth (saves fingerprint surface)
+      if (resourceType === 'font' || resourceType === 'media') {
+        return route.abort();
+      }
+    } catch (_) {
+      // ignore URL parse errors
+    }
+    return route.continue();
+  });
 
   // Enhanced anti-detection: override navigator properties
   await ctx.addInitScript((m) => {
@@ -704,12 +828,23 @@ async function launchFreeman(opts = {}) {
     Object.defineProperty(navigator, 'languages',           { get: () => [m.locale, 'en'] });
     Object.defineProperty(navigator, 'deviceMemory',        { get: () => m.mobile ? 4 : 8 });
     Object.defineProperty(navigator, 'vendor',              { get: () => m.mobile ? 'Apple Computer, Inc.' : 'Google Inc.' });
+    Object.defineProperty(navigator, 'doNotTrack',          { get: () => '1' });
+    Object.defineProperty(navigator, 'cookieEnabled',       { get: () => true });
+    Object.defineProperty(navigator, 'appCodeName',         { get: () => 'Mozilla' });
+    Object.defineProperty(navigator, 'appName',             { get: () => 'Netscape' });
+    Object.defineProperty(navigator, 'appVersion',          { get: () => '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' });
+    Object.defineProperty(navigator, 'product',             { get: () => 'Gecko' });
+    Object.defineProperty(navigator, 'productSub',          { get: () => '20030107' });
+    Object.defineProperty(navigator, 'vendorSub',           { get: () => '' });
+    Object.defineProperty(navigator, 'buildID',             { get: () => undefined });
+    Object.defineProperty(navigator, 'maxTouchPoints',      { get: () => m.mobile ? 5 : 0 });
+    Object.defineProperty(navigator, 'pdfViewerEnabled',    { get: () => true });
 
     // Override permissions
     if (navigator.permissions) {
       const originalQuery = navigator.permissions.query;
       navigator.permissions.query = async (parameters) => {
-        if (parameters.name === 'notifications' || parameters.name === 'clipboard-read' || parameters.name === 'clipboard-write') {
+        if (['notifications', 'clipboard-read', 'clipboard-write', 'geolocation', 'camera', 'microphone'].includes(parameters.name)) {
           return { state: 'prompt', onchange: null };
         }
         return originalQuery.call(navigator.permissions, parameters);
@@ -720,11 +855,16 @@ async function launchFreeman(opts = {}) {
     Object.defineProperty(navigator, 'plugins', {
       get: () => {
         const plugins = [];
+        const pluginNames = m.mobile
+          ? ['Mobile PDF Plugin', 'Mobile PDF Viewer', 'Native Client']
+          : ['Chrome PDF Plugin', 'Chrome PDF Viewer', 'Native Client'];
+        const pluginFiles = ['internal-pdf-viewer', 'internal-pdf-viewer', 'internal-nacl-plugin'];
+        const pluginDescs = ['Portable Document Format', 'Portable Document Format', ''];
         for (let i = 0; i < 3; i++) {
           plugins.push({
-            name: ['Chrome PDF Plugin', 'Chrome PDF Viewer', 'Native Client'][i],
-            filename: ['internal-pdf-viewer', 'internal-pdf-viewer', 'internal-nacl-plugin'][i],
-            description: ['Portable Document Format', 'Portable Document Format', ''][i],
+            name: pluginNames[i],
+            filename: pluginFiles[i],
+            description: pluginDescs[i],
             version: undefined,
             length: 0,
             item: () => null,
@@ -737,10 +877,16 @@ async function launchFreeman(opts = {}) {
 
     // Override mimeTypes
     Object.defineProperty(navigator, 'mimeTypes', {
-      get: () => [
-        { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
-        { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
-      ]
+      get: () => {
+        const mimes = [
+          { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+          { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: null },
+        ];
+        if (m.mobile) {
+          mimes.push({ type: 'application/x-nacl', suffixes: '', description: 'Native Client', enabledPlugin: null });
+        }
+        return mimes;
+      }
     });
 
     // Screen properties
@@ -751,6 +897,7 @@ async function launchFreeman(opts = {}) {
       Object.defineProperty(screen, 'availHeight', { get: () => 852 });
       Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
       Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+      Object.defineProperty(screen, 'orientation', { get: () => ({ type: 'portraitPrimary', angle: 0 }) });
     } else {
       Object.defineProperty(screen, 'width',       { get: () => 1440 });
       Object.defineProperty(screen, 'height',      { get: () => 900 });
@@ -758,6 +905,7 @@ async function launchFreeman(opts = {}) {
       Object.defineProperty(screen, 'availHeight', { get: () => 860 });
       Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
       Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+      Object.defineProperty(screen, 'orientation', { get: () => ({ type: 'landscapePrimary', angle: 0 }) });
     }
 
     // Connection
@@ -766,6 +914,7 @@ async function launchFreeman(opts = {}) {
         Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' });
         Object.defineProperty(navigator.connection, 'downlink',      { get: () => 10 });
         Object.defineProperty(navigator.connection, 'rtt',           { get: () => 50 });
+        Object.defineProperty(navigator.connection, 'saveData',      { get: () => false });
       } catch (_) {}
     }
 
@@ -787,13 +936,26 @@ async function launchFreeman(opts = {}) {
           }
           return originalFillText.apply(this, textArgs);
         };
+        // Randomize getImageData slightly
+        const originalGetImageData = context.getImageData;
+        context.getImageData = function(...args) {
+          const imageData = originalGetImageData.apply(this, args);
+          // Flip a few random pixels (max 2)
+          const count = Math.floor(Math.random() * 2) + 1;
+          for (let i = 0; i < count; i++) {
+            const idx = Math.floor(Math.random() * imageData.data.length / 4) * 4;
+            imageData.data[idx] = imageData.data[idx] ^ 1;
+          }
+          return imageData;
+        };
       }
       if (context && (type === 'webgl' || type === 'experimental-webgl')) {
         const getParameter = context.getParameter.bind(context);
         context.getParameter = function(parameter) {
           // Return common values to blend in
-          if (parameter === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
-          if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+          if (parameter === 37445) return 'Intel Inc.';
+          if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+          if (parameter === 37447) return 'Intel Open Source Technology Center';
           return getParameter(parameter);
         };
       }
@@ -817,6 +979,9 @@ async function launchFreeman(opts = {}) {
           RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
         })
       });
+      // Add more chrome APIs commonly checked
+      Object.defineProperty(window.chrome, 'csi', { get: () => () => {} });
+      Object.defineProperty(window.chrome, 'loadTimes', { get: () => () => {} });
     }
 
     // Override toDataURL to inject slight noise into canvas fingerprint
@@ -839,12 +1004,65 @@ async function launchFreeman(opts = {}) {
       return originalToDataURL.apply(this, args);
     };
 
+    // Override WebRTC to prevent IP leak (without breaking functionality)
+    if (window.RTCPeerConnection) {
+      const originalCreateDataChannel = window.RTCPeerConnection.prototype.createDataChannel;
+      window.RTCPeerConnection.prototype.createDataChannel = function(...args) {
+        const channel = originalCreateDataChannel.apply(this, args);
+        // Override onopen to delay and add noise
+        const originalOnOpen = channel.onopen;
+        channel.onopen = function(event) {
+          if (originalOnOpen) originalOnOpen.call(this, event);
+        };
+        return channel;
+      };
+    }
+
+    // Override navigator.getBattery (often used for fingerprinting)
+    if (navigator.getBattery) {
+      navigator.getBattery = async () => ({
+        charging: true,
+        chargingTime: 0,
+        dischargingTime: Infinity,
+        level: 1,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      });
+    }
+
+    // Override media devices
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      navigator.mediaDevices.enumerateDevices = async () => {
+        const devices = await originalEnumerateDevices();
+        return devices.map((d, i) => ({
+          ...d,
+          deviceId: d.deviceId || `device-${i}`,
+          groupId: d.groupId || `group-${i}`,
+        }));
+      };
+    }
+
+    // Prevent detection via timing attacks
+    const originalPerformanceNow = performance.now.bind(performance);
+    performance.now = function() {
+      const now = originalPerformanceNow();
+      // Add small jitter (max 0.1ms) to timing measurements
+      return now + (Math.random() - 0.5) * 0.1;
+    };
+
+    // Override Date to prevent timing fingerprinting
+    const originalDateNow = Date.now.bind(Date);
+    Date.now = function() {
+      return originalDateNow() + Math.floor((Math.random() - 0.5) * 2);
+    };
+
   }, { mobile, locale: device.locale });
 
   // Add additional headers to avoid detection
   await ctx.setExtraHTTPHeaders({
     'Accept-Language': device.locale + (device.locale === 'en-US' ? ',en;q=0.9' : ',en-US;q=0.9,en;q=0.8'),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'max-age=0',
     'Upgrade-Insecure-Requests': '1',
@@ -852,6 +1070,10 @@ async function launchFreeman(opts = {}) {
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
+    'Sec-CH-UA': `"Chromium";v="${CHROME_MAJOR}", "Not_A Brand";v="99", "Google Chrome";v="${CHROME_MAJOR}"`,
+    'Sec-CH-UA-Mobile': mobile ? '?1' : '?0',
+    'Sec-CH-UA-Platform': mobile ? '"iOS"' : '"Windows"',
+    'Priority': 'u=0, i',
   });
 
   const page = await ctx.newPage();
@@ -862,6 +1084,74 @@ async function launchFreeman(opts = {}) {
   page.solveSliderCaptcha = (opts) => solveSliderCaptcha(page, opts);
 
   return { browser, ctx, page, humanClick, humanMouseMove, humanType, humanScroll, humanRead, sleep, rand };
+}
+
+// ─── SMART NAVIGATION WITH RETRY ──────────────────────────────────────────────
+
+/**
+ * Navigate to a URL with automatic retry on failure.
+ * @param {Page} page - Playwright page
+ * @param {string} url - URL to navigate to
+ * @param {Object} opts - Options
+ * @returns {Promise<void>}
+ */
+async function smartNavigate(page, url, opts = {}) {
+  const { timeout = 60000, retries = 2, waitUntil = 'auto' } = opts;
+  const lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      if (attempt > 0) {
+        await sleep(rand(2000, 5000));
+      }
+
+      // Determine waitUntil strategy
+      let currentWaitUntil = waitUntil;
+      if (waitUntil === 'auto') {
+        // First attempt: try domcontentloaded (fast)
+        // If retry is needed, fall back to networkidle for SPA-like pages
+        currentWaitUntil = attempt === 0 ? 'domcontentloaded' : 'networkidle';
+      }
+
+      await page.goto(url, { waitUntil: currentWaitUntil, timeout });
+      
+      // If using auto strategy and domcontentloaded succeeded, do a quick content check
+      // to see if the page looks fully loaded or needs networkidle
+      if (waitUntil === 'auto' && currentWaitUntil === 'domcontentloaded' && attempt === 0) {
+        await sleep(2000);
+        const pageInfo = await page.evaluate(() => {
+          const bodyLen = document.body?.innerText?.trim().length || 0;
+          const imgCount = document.querySelectorAll('img').length;
+          const hasLoadingIndicators = document.querySelectorAll('.loading, .spinner, [data-loading], .loading-spinner').length;
+          return { bodyLen, imgCount, hasLoadingIndicators };
+        });
+
+        // If page has very little content and has images or loading indicators, 
+        // it's likely an SPA that needs networkidle
+        if (pageInfo.bodyLen < 500 && (pageInfo.imgCount > 0 || pageInfo.hasLoadingIndicators > 0)) {
+          log?.(`[smartNavigate] Page looks incomplete (${pageInfo.bodyLen} chars, ${pageInfo.imgCount} imgs), retrying with networkidle...`);
+          throw new Error('Incomplete page load, retrying with networkidle');
+        }
+      }
+      
+      return;
+    } catch (err) {
+      if (attempt === retries) {
+        throw new Error(`Navigation failed after ${retries + 1} attempts: ${err.message}`);
+      }
+      // Check if we need to handle a captcha or error page
+      const pageText = await page.evaluate(() => document.body?.innerText?.toLowerCase() || '');
+      if (pageText.includes('captcha') || pageText.includes('验证') || pageText.includes('slider')) {
+        // Try to handle captcha
+        const detected = await detectSliderCaptcha(page);
+        if (detected) {
+          await solveSliderCaptcha(page, { maxRetries: 2 });
+          await sleep(3000);
+          continue;
+        }
+      }
+    }
+  }
 }
 
 // ─── SHADOW DOM UTILITIES ─────────────────────────────────────────────────────
@@ -941,10 +1231,108 @@ async function pasteIntoEditor(page, editorSelector, text) {
   await sleep(500);
 }
 
+// ─── RETRY EXTRACTION HELPER ───────────────────────────────────────────────────
+/**
+ * Shared retry wrapper for article extraction.
+ * Runs `attemptFn` up to `retries + 1` times, with backoff between attempts.
+ * Each attempt should return `{ articleData, contentReady }` or throw.
+ * If extraction is incomplete but data exists, returns `{ partial: true }`.
+ *
+ * @param {Object} opts
+ * @param {Function} opts.log - logger
+ * @param {string} opts.label - fetcher name for logs
+ * @param {Page} opts.page - Playwright page
+ * @param {number} opts.retries - max retry attempts after first failure
+ * @param {Function} opts.attemptFn - async function returning { articleData, contentReady }
+ * @returns {Promise<Object>} result object
+ */
+async function retryExtract({ log, label, page, retries = 2, attemptFn }) {
+  let lastArticleData = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      log(`🔄 [${label}] Retry attempt ${attempt + 1}/${retries + 1}...`);
+      await sleep(rand(3000, 6000));
+    }
+
+    let articleData = null;
+    let contentReady = false;
+
+    try {
+      const result = await attemptFn({ attempt, page });
+      articleData = result.articleData;
+      contentReady = result.contentReady;
+    } catch (err) {
+      log(`❌ [${label}] Attempt ${attempt + 1} threw: ${err.message}`);
+      if (attempt >= retries) throw err;
+      continue;
+    }
+
+    const hasTitle = articleData && articleData.title && articleData.title.length > 0;
+    const hasContent = articleData && articleData.textContent && articleData.textContent.length > 100;
+    log(`   [${label}] Extracted: title="${articleData?.title?.slice(0, 50) || 'N/A'}", content=${articleData?.textContent?.length || 0} chars`);
+
+    if (hasTitle && hasContent) {
+      log(`✅ [${label}] Article extracted successfully`);
+      return { success: true, data: articleData, partial: false };
+    }
+
+    lastArticleData = articleData;
+
+    if (contentReady) {
+      log(`⚠️ [${label}] Content ready but extraction incomplete`);
+    } else {
+      log(`⚠️ [${label}] Content not ready after attempt ${attempt + 1}`);
+    }
+
+    if (attempt >= retries) {
+      log(`❌ [${label}] Extraction failed after all retries`);
+      break;
+    }
+  }
+
+  if (lastArticleData) {
+    log(`⚠️ [${label}] Returning partial article data`);
+    return { success: true, data: lastArticleData, partial: true };
+  }
+
+  throw new Error(`[${label}] Failed to extract article after all retries`);
+}
+
+/**
+ * Shared browser lifecycle helper.
+ * Launches browser, sets viewport, injects init scripts, runs work, and closes browser.
+ *
+ * @param {Object} opts
+ * @param {Object} opts.launchOpts - options passed to launchFreeman
+ * @param {Array<Function>} opts.initScripts - init scripts to inject
+ * @param {Function} opts.work - async function receiving page
+ * @param {Function} opts.log - logger
+ * @returns {Promise<*>} result of work(page)
+ */
+async function withBrowser({ launchOpts, initScripts = [], work, log }) {
+  const { browser, page } = await launchFreeman(launchOpts);
+
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    for (const script of initScripts) {
+      await page.addInitScript(script);
+    }
+    return await work(page);
+  } catch (error) {
+    log('❌ Error fetching article:', error.message);
+    throw error;
+  } finally {
+    if (browser) await browser.close();
+    log('🔒 Browser closed');
+  }
+}
+
 // ─── XUEQIU ARTICLE FETCHER ───────────────────────────────────────────────────
 
 /**
  * Fetch a Xueqiu article with automatic slider captcha handling
+ * Supports both HTML page scraping and API direct access (when available)
  * @param {string} articleUrl - The Xueqiu article URL
  * @param {Object} opts - Options
  * @returns {Promise<Object>} - Article data
@@ -962,170 +1350,383 @@ async function fetchXueqiuArticle(articleUrl, opts = {}) {
   log('🚀 Launching Freeman Browser for Xueqiu...');
   log(`🔗 URL: ${articleUrl}`);
 
-  const { browser, page } = await launchFreeman({ mobile: false, headless });
-
-  try {
-    // Set a realistic viewport for desktop
-    await page.setViewportSize({ width: 1440, height: 900 });
-
-    // Additional WebRTC IP leak prevention (not covered by launchFreeman)
-    await page.addInitScript(() => {
-      const originalRTCPeerConnection = window.RTCPeerConnection;
-      if (originalRTCPeerConnection) {
-        window.RTCPeerConnection = function(...args) {
-          const pc = new originalRTCPeerConnection(...args);
-          const originalCreateDataChannel = pc.createDataChannel.bind(pc);
-          pc.createDataChannel = function(...dcArgs) {
-            return originalCreateDataChannel(...dcArgs);
+  return withBrowser({
+    launchOpts: { mobile: false, headless },
+    initScripts: [
+      () => {
+        const originalRTCPeerConnection = window.RTCPeerConnection;
+        if (originalRTCPeerConnection) {
+          window.RTCPeerConnection = function(...args) {
+            const pc = new originalRTCPeerConnection(...args);
+            const originalCreateDataChannel = pc.createDataChannel.bind(pc);
+            pc.createDataChannel = function(...dcArgs) {
+              return originalCreateDataChannel(...dcArgs);
+            };
+            return pc;
           };
-          return pc;
-        };
+        }
+      },
+    ],
+    work: async (page) => {
+      // Try API direct access first (more reliable, less likely to be blocked)
+      const apiResult = await _tryXueqiuApi(page, articleUrl, log);
+      if (apiResult) {
+        return apiResult;
       }
-    });
 
-    // Navigate to the article with extended timeout
-    log('📡 Navigating to article...');
-    await page.goto(articleUrl, {
-      waitUntil: 'networkidle',
-      timeout: timeout,
-    });
+      // Use shared retry wrapper for HTML fallback
+      const result = await retryExtract({
+        log,
+        label: 'xueqiu',
+        page,
+        retries: 2,
+        attemptFn: async ({ attempt, page }) => {
+          // Fallback to HTML scraping
+          log('📡 Navigating to article (HTML fallback)...');
+          await smartNavigate(page, articleUrl, { timeout, waitUntil: 'auto' });
 
-    // Wait for initial load
-    await sleep(3000);
+          // Wait for initial load
+          await sleep(3000 + attempt * 1000);
 
-    // Check for slider captcha
-    log('🔍 Checking for slider captcha...');
-    const sliderDetected = await detectSliderCaptcha(page);
+          // Check for slider captcha
+          log('🔍 Checking for slider captcha...');
+          const sliderDetected = await detectSliderCaptcha(page);
 
-    if (sliderDetected) {
-      log('🚨 Slider captcha detected, attempting to solve...');
-      const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
-      if (!solved) {
-        log('❌ Failed to solve slider captcha');
-        // Take a screenshot for debugging
-        try {
-          await page.screenshot({ path: 'xueqiu_slider_failed.png' });
-          log('📸 Screenshot saved to xueqiu_slider_failed.png');
-        } catch (_) {}
-        throw new Error('Slider captcha could not be solved');
-      }
-      log('✅ Slider captcha solved!');
-      // Wait for page to load after captcha
-      await sleep(5000);
+          if (sliderDetected) {
+            log('🚨 Slider captcha detected, attempting to solve...');
+            const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
+            if (!solved) {
+              log('❌ Failed to solve slider captcha');
+              try {
+                await page.screenshot({ path: 'xueqiu_slider_failed.png' });
+                log('📸 Screenshot saved to xueqiu_slider_failed.png');
+              } catch (_) {}
+              throw new Error('Slider captcha could not be solved');
+            }
+            log('✅ Slider captcha solved!');
+            await sleep(5000 + attempt * 1000);
+          }
+
+          // Wait for article content to load
+          let contentReady = false;
+          if (waitForContent) {
+            log('⏳ Waiting for article content...');
+            try {
+              await page.waitForSelector('article, .article-content, .article__content, .content, [class*="article"], .status-content, .article__bd', {
+                timeout: 30000,
+                state: 'attached',
+              });
+              const textLen = await page.evaluate(() => {
+                const el = document.querySelector('article, .article-content, .article__content, .content, [class*="article"], .status-content, .article__bd');
+                return el ? el.textContent.trim().length : 0;
+              });
+              if (textLen > 100) {
+                contentReady = true;
+              } else {
+                log(`⚠️ Article element found but too short (${textLen} chars), may be error page...`);
+              }
+            } catch (_) {
+              log('⚠️ Could not find article content selector, continuing...');
+            }
+
+            if (!contentReady) {
+              const pageInfo = await page.evaluate(() => {
+                const bodyText = document.body.innerText.trim();
+                const titleText = (document.querySelector('h1, .title, .article-title') || {}).textContent?.trim() || '';
+                const errorIndicators = [
+                  '请先登录', '登录后查看更多', '内容加载失败', '页面不存在',
+                  '已被删除', '无法访问', '加载中...', 'loading...', '加载失败',
+                ];
+                const isErrorPage = errorIndicators.some(ind => bodyText.includes(ind) || titleText.includes(ind));
+                const hasContent = bodyText.length > 200;
+                return {
+                  titleText: titleText.slice(0, 100),
+                  bodyLength: bodyText.length,
+                  isErrorPage,
+                  hasContent,
+                  url: window.location.href,
+                };
+              });
+
+              log(`   Page state: title="${pageInfo.titleText}", body=${pageInfo.bodyLength} chars, error=${pageInfo.isErrorPage}`);
+
+              if (pageInfo.isErrorPage || !pageInfo.hasContent) {
+                log('❌ Xueqiu error/blocked page detected, will retry navigation...');
+                throw new Error('Xueqiu error page detected: ' + pageInfo.titleText);
+              }
+
+              if (!contentReady && pageInfo.hasContent) {
+                log('⚠️ Content element not found but page has text, will try fallback extraction');
+              }
+            }
+          }
+
+          // Extract article data
+          log('📄 Extracting article data...');
+          const articleData = await page.evaluate(() => {
+            const data = {
+              title: '',
+              author: '',
+              content: '',
+              textContent: '',
+              publishTime: '',
+              url: window.location.href,
+            };
+
+            // Title selectors (ordered by priority)
+            const titleSelectors = [
+              'h1.article-title', 'h1.title', '.article-title h1', '.article__title',
+              '.article-title', 'h1', '.title', '[class*="article-title"]', '[class*="ArticleTitle"]',
+              '.status-title', '.article-title-text',
+            ];
+            for (const sel of titleSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.title = el.textContent.trim();
+                break;
+              }
+            }
+
+            // Author selectors
+            const authorSelectors = [
+              '.author-name', '.article-author', '.user-name', '.author',
+              '[class*="author-name"]', '[class*="AuthorName"]', '[class*="user-name"]', '[class*="UserName"]',
+              '.status-user-name', '.user-info .name',
+              // Xueqiu specific: hidden metadata paragraph
+              '.article__bd__detail p[style*="display:none"], .article__bd p[style*="display:none"], .article-detail p[style*="none"]',
+            ];
+            for (const sel of authorSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                const text = el.textContent.trim();
+                // Try to extract author from "作者：XXX" pattern
+                const authorMatch = text.match(/作者[：:]\s*([^，,（(]+)/);
+                if (authorMatch) {
+                  data.author = authorMatch[1].trim();
+                  break;
+                }
+                data.author = text;
+                break;
+              }
+            }
+
+            // Content selectors (try multiple patterns)
+            const contentSelectors = [
+              'article.article__bd', '.article__bd', '.article-content', '.article__content',
+              'article', '.content', '[class*="article-content"]', '[class*="ArticleContent"]',
+              '.post-content', '.article-body', '#article_content', '.status-content',
+              '.article-text', '.status-text', '.timeline__article__content',
+              // Xueqiu article body
+              '.article__bd__detail', '.article-detail__content',
+            ];
+            for (const sel of contentSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim().length > 100) {
+                data.content = el.innerHTML;
+                data.textContent = el.textContent.trim();
+                break;
+              }
+            }
+
+            // Time selectors
+            const timeSelectors = [
+              '.article-time', '.publish-time', '.time', '[class*="article-time"]', '[class*="publish-time"]',
+              'time', '[class*="time"]', '[class*="Time"]', '[class*="date"]', '[class*="Date"]',
+              '.status-time', '.article__time', '.created-time',
+              // Xueqiu specific
+              '.article__bd__detail .time', '.status-publish-time',
+            ];
+            for (const sel of timeSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                const timeText = el.textContent.trim();
+                // Basic validation: reject obvious non-time values
+                const looksLikeTime = /^\d|年|月|日|前|刚刚|分钟|小时|天|周|月|季|年|昨天|今天|明天|星期|周[一二三四五六日]/.test(timeText) ||
+                                      timeText.length >= 6 && /^\d{4}/.test(timeText);
+                if (looksLikeTime) {
+                  data.publishTime = timeText;
+                  break;
+                }
+              }
+            }
+
+            // Fallback: extract from meta tags
+            if (!data.title) {
+              const metaTitle = document.querySelector('meta[property="og:title"]');
+              if (metaTitle) data.title = metaTitle.getAttribute('content');
+            }
+
+            // Fallback: extract from title tag
+            if (!data.title) {
+              data.title = document.title?.replace(/\s*-\s*雪球.*$/, '').trim() || '';
+            }
+
+            // Fallback: extract from body text
+            if (!data.textContent) {
+              const bodyText = document.body.innerText.trim();
+              if (bodyText.length > 200) {
+                data.textContent = bodyText;
+              }
+            }
+
+            return data;
+          });
+
+          const hasTitle = articleData.title && articleData.title.length > 0;
+          const hasContent = articleData.textContent && articleData.textContent.length > 100;
+          return {
+            articleData,
+            contentReady: hasTitle && hasContent,
+          };
+        },
+      });
+      return result;
+    },
+    log,
+  });
+}
+
+/**
+ * Convert HTML string to plain text (Node-side, no browser DOM required).
+ * Uses a simple tag-stripping approach that preserves meaningful whitespace.
+ * @param {string} html
+ * @returns {string}
+ */
+function htmlToText(html) {
+  if (!html || typeof html !== 'string') return '';
+  // Insert newline before block-level tags, then strip all tags
+  const text = html
+    .replace(/<\s*(p|div|br|tr|li|h[1-6]|blockquote|pre|ul|ol|table|thead|tbody|tfoot|section|article|header|footer|aside|nav|main|figure|figcaption)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    // Decode common HTML entities
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    // Collapse whitespace
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return text;
+}
+
+/**
+ * Try to fetch Xueqiu article via API (more reliable, bypasses HTML scraping issues)
+ * @param {Page} page - Playwright page
+ * @param {string} articleUrl - The Xueqiu article URL
+ * @param {Function} log - Logger function
+ * @returns {Promise<Object|null>} - Article data or null if API fails
+ */
+async function _tryXueqiuApi(page, articleUrl, log) {
+  try {
+    // Extract article ID from URL
+    // Patterns: https://xueqiu.com/123456/789012345 or https://xueqiu.com/status/123456789
+    const idMatch = articleUrl.match(/\/(\d+)(?:\/|\?|$)/);
+    if (!idMatch) {
+      log('   [API] Could not extract article ID from URL');
+      return null;
     }
 
-    // Wait for article content to load
-    if (waitForContent) {
-      log('⏳ Waiting for article content...');
+    const articleId = idMatch[1];
+    log(`   [API] Trying direct API access for article ${articleId}...`);
+
+    // Try Xueqiu API endpoints
+    const apiUrls = [
+      `https://xueqiu.com/statuses/original/show.json?id=${articleId}`,
+      `https://xueqiu.com/statuses/${articleId}/detail.json`,
+    ];
+
+    // Get cookies from the page context
+    const cookies = await page.context().cookies();
+    const cookieString = cookies
+      .filter(c => c.domain.includes('xueqiu.com'))
+      .map(c => `${c.name}=${c.value}`)
+      .join('; ');
+
+    if (!cookieString) {
+      log('   [API] No cookies available, skipping API attempt');
+      return null;
+    }
+
+    for (const apiUrl of apiUrls) {
       try {
-        await page.waitForSelector('article, .article-content, .article__content, .content, [class*="article"]', {
-          timeout: 20000,
-        });
-      } catch (_) {
-        log('⚠️ Could not find article content selector, continuing...');
+        const response = await page.evaluate(async (url, cookies) => {
+          try {
+            const res = await fetch(url, {
+              method: 'GET',
+              headers: {
+                'Cookie': cookies,
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Referer': 'https://xueqiu.com/',
+                'User-Agent': navigator.userAgent,
+              },
+              credentials: 'include',
+            });
+            if (!res.ok) return { error: `HTTP ${res.status}` };
+            const text = await res.text();
+            try {
+              return { data: JSON.parse(text) };
+            } catch (_) {
+              return { data: text };
+            }
+          } catch (e) {
+            return { error: e.message };
+          }
+        }, apiUrl, cookieString);
+
+        if (response.error) {
+          log(`   [API] ${apiUrls.indexOf(apiUrl) + 1}/${apiUrls.length} failed: ${response.error}`);
+          continue;
+        }
+
+        if (response.data) {
+          const data = response.data;
+          // Parse API response
+          let articleData = {
+            title: '',
+            author: '',
+            content: '',
+            textContent: '',
+            publishTime: '',
+            url: articleUrl,
+          };
+
+          // Try to extract from API response structure
+          if (typeof data === 'object') {
+            articleData.title = data.title || data.status_title || data.description || '';
+            articleData.author = data.user?.screen_name || data.user?.name || data.author || '';
+            articleData.content = data.text || data.description || data.content || '';
+            articleData.textContent = data.text || data.description || data.content || '';
+            articleData.publishTime = data.created_at || data.time || data.publishTime || '';
+
+            // If content is HTML, extract text on Node side (no browser DOM needed)
+            if (articleData.content && articleData.content.includes('<')) {
+              articleData.textContent = htmlToText(articleData.content) || articleData.textContent;
+            }
+          }
+
+          if (articleData.title || articleData.textContent) {
+            log('   [API] ✅ Successfully fetched via API');
+            return {
+              success: true,
+              data: articleData,
+              url: articleUrl,
+            };
+          }
+        }
+      } catch (err) {
+        log(`   [API] Error: ${err.message}`);
       }
     }
 
-    // Extract article data
-    log('📄 Extracting article data...');
-    const articleData = await page.evaluate(() => {
-      const data = {
-        title: '',
-        author: '',
-        content: '',
-        textContent: '',
-        publishTime: '',
-        url: window.location.href,
-      };
-
-      // Try multiple selectors for title (雪球文章标题通常在h1或特定class中)
-      const titleSelectors = [
-        'h1.article-title', 'h1.title', '.article-title h1', '.article__title',
-        '.article-title', 'h1', '.title', '[class*="article-title"]', '[class*="ArticleTitle"]'
-      ];
-      for (const sel of titleSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.title = el.textContent.trim();
-          break;
-        }
-      }
-
-      // Try multiple selectors for author
-      const authorSelectors = [
-        '.author-name', '.article-author', '.user-name', '.author',
-        '[class*="author-name"]', '[class*="AuthorName"]', '[class*="user-name"]', '[class*="UserName"]'
-      ];
-      for (const sel of authorSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.author = el.textContent.trim();
-          break;
-        }
-      }
-
-      // Try multiple selectors for content (雪球文章内容通常在article或特定class中)
-      const contentSelectors = [
-        'article.article__bd', '.article__bd', '.article-content', '.article__content',
-        'article', '.content', '[class*="article-content"]', '[class*="ArticleContent"]',
-        '.post-content', '.article-body', '#article_content'
-      ];
-      for (const sel of contentSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 100) {
-          data.content = el.innerHTML;
-          data.textContent = el.textContent.trim();
-          break;
-        }
-      }
-
-      // Try multiple selectors for publish time
-      const timeSelectors = [
-        '.article-time', '.publish-time', '.time', '[class*="article-time"]', '[class*="publish-time"]',
-        'time', '[class*="time"]', '[class*="Time"]', '[class*="date"]', '[class*="Date"]'
-      ];
-      for (const sel of timeSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.publishTime = el.textContent.trim();
-          break;
-        }
-      }
-
-      // If no title found, try to extract from meta tags
-      if (!data.title) {
-        const metaTitle = document.querySelector('meta[property="og:title"]');
-        if (metaTitle) data.title = metaTitle.getAttribute('content');
-      }
-
-      // If no content found, try body text
-      if (!data.textContent) {
-        const bodyText = document.body.innerText.trim();
-        if (bodyText.length > 200) {
-          data.textContent = bodyText;
-        }
-      }
-
-      return data;
-    });
-
-    log('✅ Article extracted successfully');
-    log(`   Title: ${articleData.title?.slice(0, 50) || 'N/A'}${articleData.title?.length > 50 ? '...' : ''}`);
-    log(`   Author: ${articleData.author || 'N/A'}`);
-    log(`   Content length: ${articleData.textContent?.length || 0} chars`);
-
-    return {
-      success: true,
-      data: articleData,
-      url: articleUrl,
-    };
-
-  } catch (error) {
-    log('❌ Error fetching article:', error.message);
-    throw error;
-  } finally {
-    if (browser) await browser.close();
-    log('🔒 Browser closed');
+    log('   [API] All API attempts failed, falling back to HTML');
+    return null;
+  } catch (err) {
+    log('   [API] Exception:', err.message);
+    return null;
   }
 }
 
@@ -1133,6 +1734,7 @@ async function fetchXueqiuArticle(articleUrl, opts = {}) {
 
 /**
  * Fetch a WeChat Official Account article with automatic slider captcha handling
+ * Enhanced anti-detection for WeChat's environment checks
  * @param {string} articleUrl - The WeChat article URL (mp.weixin.qq.com)
  * @param {Object} opts - Options
  * @returns {Promise<Object>} - Article data
@@ -1150,218 +1752,325 @@ async function fetchWechatArticle(articleUrl, opts = {}) {
   log('🚀 Launching Freeman Browser for WeChat...');
   log(`🔗 URL: ${articleUrl}`);
 
-  const { browser, page } = await launchFreeman({ mobile: false, headless });
+  return withBrowser({
+    launchOpts: { mobile: false, headless },
+    initScripts: [
+      () => {
+        // Override window.navigator properties that WeChat checks
+        Object.defineProperty(window.navigator, 'appVersion', { get: () => '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' });
 
-  try {
-    // Set a realistic viewport for desktop
-    await page.setViewportSize({ width: 1440, height: 900 });
-
-    // Navigate to the article with extended timeout
-    log('📡 Navigating to article...');
-    await page.goto(articleUrl, {
-      waitUntil: 'networkidle',
-      timeout: timeout,
-    });
-
-    // Wait for initial load
-    await sleep(3000);
-
-    // Check for slider captcha
-    log('🔍 Checking for slider captcha...');
-    const sliderDetected = await detectSliderCaptcha(page);
-
-    if (sliderDetected) {
-      log('🚨 Slider captcha detected, attempting to solve...');
-      const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
-      if (!solved) {
-        log('❌ Failed to solve slider captcha');
-        // Take a screenshot for debugging
-        try {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          await page.screenshot({ path: `wechat_slider_failed_${timestamp}.png` });
-          log(`📸 Screenshot saved to wechat_slider_failed_${timestamp}.png`);
-        } catch (_) {}
-        throw new Error('Slider captcha could not be solved');
-      }
-      log('✅ Slider captcha solved!');
-      // Wait for page to load after captcha
-      await sleep(5000);
-    }
-
-    // Wait for article content to load
-    if (waitForContent) {
-      log('⏳ Waiting for article content...');
-      try {
-        // WeChat articles typically load in #js_content or .rich_media_content
-        await page.waitForSelector('#js_content, .rich_media_content, #activity_name, .rich_media_title', {
-          timeout: 20000,
-        });
-      } catch (_) {
-        log('⚠️ Could not find WeChat content selector, continuing...');
-      }
-    }
-
-    // Extract article data with WeChat-specific selectors
-    log('📄 Extracting WeChat article data...');
-    const articleData = await page.evaluate(() => {
-      const data = {
-        title: '',
-        author: '',
-        content: '',
-        textContent: '',
-        publishTime: '',
-        source: '',
-        url: window.location.href,
-      };
-
-      // WeChat title selectors
-      const titleSelectors = [
-        '#activity_name',
-        '.rich_media_title',
-        'h2.rich_media_title',
-        'h1',
-        '.article-title',
-        '#js_article_title',
-      ];
-      for (const sel of titleSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.title = el.textContent.trim();
-          break;
+        // Prevent WeChat from detecting automation via window.chrome
+        if (window.chrome) {
+          Object.defineProperty(window.chrome, 'csi', { get: () => () => ({startE: 0, onloadT: Date.now(), transition: 0}) });
+          Object.defineProperty(window.chrome, 'loadTimes', { get: () => () => ({requestTime: Date.now()/1000 - 1, startLoadTime: Date.now()/1000 - 1, commitLoadTime: Date.now()/1000 - 0.5, finishDocumentLoadTime: Date.now()/1000 - 0.3, finishLoadTime: Date.now()/1000 - 0.2, firstPaintTime: Date.now()/1000 - 0.4, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: false, wasNpnNegotiated: false, npnNegotiatedProtocol: '', }) });
         }
-      }
 
-      // WeChat author selectors
-      const authorSelectors = [
-        '#js_name',
-        '.profile_nickname',
-        '.rich_media_meta_nickname',
-        '#profileBt a',
-        '.account_nickname',
-        '.wx_follow_nickname',
-      ];
-      for (const sel of authorSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.author = el.textContent.trim();
-          break;
+        // Override document.hidden / visibilityState (WeChat checks these)
+        Object.defineProperty(document, 'hidden', { get: () => false });
+        Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+
+        // Override document.hasFocus
+        if (document.hasFocus) {
+          document.hasFocus = () => true;
         }
-      }
 
-      // WeChat content selectors
-      const contentSelectors = [
-        '#js_content',
-        '.rich_media_content',
-        '#js_article_content',
-        '.article-content',
-        '#content',
-      ];
-      for (const sel of contentSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 100) {
-          data.content = el.innerHTML;
-          data.textContent = el.textContent.trim();
-          break;
+        // Override performance timing to look realistic
+        if (performance.timing) {
+          const now = Date.now();
+          performance.timing = {
+            ...performance.timing,
+            navigationStart: now - 5000,
+            unloadEventStart: now - 4000,
+            unloadEventEnd: now - 3800,
+            redirectStart: now - 3700,
+            redirectEnd: now - 3600,
+            fetchStart: now - 3500,
+            domainLookupStart: now - 3400,
+            domainLookupEnd: now - 3200,
+            connectStart: now - 3100,
+            connectEnd: now - 2800,
+            requestStart: now - 2700,
+            responseStart: now - 1500,
+            responseEnd: now - 1000,
+            domLoading: now - 900,
+            domInteractive: now - 500,
+            domContentLoadedEventStart: now - 400,
+            domContentLoadedEventEnd: now - 300,
+            domComplete: now - 100,
+            loadEventStart: now - 50,
+            loadEventEnd: now,
+          };
         }
-      }
 
-      // WeChat publish time selectors
-      const timeSelectors = [
-        '#publish_time',
-        '.rich_media_meta_text',
-        '#js_publish_time',
-        '.article-date',
-        'em#publish_time',
-        '.publish_time',
-      ];
-      for (const sel of timeSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.publishTime = el.textContent.trim();
-          break;
-        }
-      }
-
-      // WeChat source/original link
-      const sourceSelectors = [
-        '.rich_media_meta_link',
-        '#js_source_url',
-        '.original_link',
-      ];
-      for (const sel of sourceSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          data.source = el.href || el.textContent.trim();
-          break;
-        }
-      }
-
-      // Fallback: extract from meta tags
-      if (!data.title) {
-        const metaTitle = document.querySelector('meta[property="og:title"], meta[name="title"]');
-        if (metaTitle) data.title = metaTitle.getAttribute('content');
-      }
-
-      // Fallback: extract author from text content if not found
-      if (!data.author && data.textContent) {
-        // WeChat articles often have author info in the first few lines
-        const lines = data.textContent.split('\n').filter(l => l.trim());
-        if (lines.length > 1) {
-          // Check if second line looks like an author name (short, no special chars)
-          const secondLine = lines[1].trim();
-          if (secondLine.length < 50 && !secondLine.includes('：') && !secondLine.includes(':')) {
-            data.author = secondLine;
+        // Intercept and allow WeChat's resource loading
+        const originalFetch = window.fetch;
+        window.fetch = function(...args) {
+          const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+          // Allow WeChat's own resources
+          if (url.includes('res.wx.qq.com') || url.includes('mmbiz.qpic.cn') || url.includes('mp.weixin.qq.com')) {
+            return originalFetch.apply(this, args);
           }
-        }
-      }
-
-      // Fallback: extract publish time from text content
-      if (!data.publishTime && data.textContent) {
-        // Look for date patterns in text
-        const datePatterns = [
-          /(\d{4}年\d{1,2}月\d{1,2}日)/,
-          /(\d{4}-\d{2}-\d{2})/,
-          /(\d{4}\/\d{2}\/\d{2})/,
-        ];
-        for (const pattern of datePatterns) {
-          const match = data.textContent.match(pattern);
-          if (match) {
-            data.publishTime = match[1];
-            break;
+          // Block obvious tracking
+          if (url.includes('trace') || url.includes('log') || url.includes('beacon')) {
+            return new Response(null, { status: 200 });
           }
-        }
-      }
+          return originalFetch.apply(this, args);
+        };
+      },
+    ],
+    work: async (page) => {
+      // Use shared retry wrapper for navigation + extraction
+      const result = await retryExtract({
+        log,
+        label: 'wechat',
+        page,
+        retries: 2,
+        attemptFn: async ({ attempt, page }) => {
+          // Navigate to the article
+          log('📡 Navigating to article...');
+          await smartNavigate(page, articleUrl, { timeout, waitUntil: 'auto' });
 
-      // If no content found, try body text
-      if (!data.textContent) {
-        const bodyText = document.body.innerText.trim();
-        if (bodyText.length > 200) {
-          data.textContent = bodyText;
-        }
-      }
+          // Wait for initial load
+          await sleep(3000 + attempt * 1000);
 
-      return data;
-    });
+          // Check for slider captcha
+          log('🔍 Checking for slider captcha...');
+          const sliderDetected = await detectSliderCaptcha(page);
 
-    log('✅ Article extracted successfully');
-    log(`   Title: ${articleData.title?.slice(0, 50) || 'N/A'}${articleData.title?.length > 50 ? '...' : ''}`);
-    log(`   Author: ${articleData.author || 'N/A'}`);
-    log(`   Publish Time: ${articleData.publishTime || 'N/A'}`);
-    log(`   Content length: ${articleData.textContent?.length || 0} chars`);
+          if (sliderDetected) {
+            log('🚨 Slider captcha detected, attempting to solve...');
+            const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
+            if (!solved) {
+              log('❌ Failed to solve slider captcha');
+              try {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                await page.screenshot({ path: `wechat_slider_failed_${timestamp}.png` });
+                log(`📸 Screenshot saved to wechat_slider_failed_${timestamp}.png`);
+              } catch (_) {}
+              throw new Error('Slider captcha could not be solved');
+            }
+            log('✅ Slider captcha solved!');
+            await sleep(5000 + attempt * 1000);
+          }
 
-    return {
-      success: true,
-      data: articleData,
-      url: articleUrl,
-    };
+          // Wait for article content to load
+          let contentReady = false;
+          if (waitForContent) {
+            log('⏳ Waiting for article content...');
+            try {
+              // Wait for the actual article content element with stricter criteria
+              await page.waitForSelector('#js_content', {
+                timeout: 30000,
+                state: 'attached',
+              });
+              const textLen = await page.evaluate(() => {
+                const el = document.querySelector('#js_content');
+                return el ? el.textContent.trim().length : 0;
+              });
+              if (textLen > 100) {
+                contentReady = true;
+              } else {
+                log(`⚠️ #js_content found but too short (${textLen} chars), may be error page...`);
+              }
+            } catch (_) {
+              log('⚠️ Could not find #js_content within timeout, continuing with fallback selectors...');
+            }
 
-  } catch (error) {
-    log('❌ Error fetching article:', error.message);
-    throw error;
-  } finally {
-    if (browser) await browser.close();
-    log('🔒 Browser closed');
-  }
+            // If content is not ready, check if we're on an error/anti-bot page
+            if (!contentReady) {
+              const pageInfo = await page.evaluate(() => {
+                const bodyText = document.body.innerText.trim();
+                const titleText = (document.querySelector('#activity_name, .rich_media_title, h1') || {}).textContent?.trim() || '';
+                const errorIndicators = [
+                  '环境异常', '操作频繁', '请在微信客户端打开',
+                  '该内容已被删除', '此内容因违规无法查看',
+                  '无法验证', '请稍后重试', 'loading...', '加载中',
+                  '请输入验证码', '人机验证', '安全验证',
+                ];
+                const isErrorPage = errorIndicators.some(ind => bodyText.includes(ind) || titleText.includes(ind));
+                const hasContent = bodyText.length > 500;
+                return {
+                  titleText: titleText.slice(0, 100),
+                  bodyLength: bodyText.length,
+                  isErrorPage,
+                  hasContent,
+                  url: window.location.href,
+                };
+              });
+
+              log(`   Page state: title="${pageInfo.titleText}", body=${pageInfo.bodyLength} chars, error=${pageInfo.isErrorPage}`);
+
+              if (pageInfo.isErrorPage || !pageInfo.hasContent) {
+                log('❌ WeChat error/anti-bot page detected, will retry navigation...');
+                throw new Error('WeChat error page detected: ' + pageInfo.titleText);
+              }
+
+              if (!contentReady && pageInfo.hasContent) {
+                log('⚠️ Content element not found but page has text, will try fallback extraction');
+              }
+            }
+          }
+
+          // Extract article data with WeChat-specific selectors
+          log('📄 Extracting WeChat article data...');
+          const articleData = await page.evaluate(() => {
+            const data = {
+              title: '',
+              author: '',
+              content: '',
+              textContent: '',
+              publishTime: '',
+              source: '',
+              url: window.location.href,
+            };
+
+            // WeChat title selectors (most specific first)
+            const titleSelectors = [
+              '#activity_name',
+              '.rich_media_title',
+              'h2.rich_media_title',
+              'h1',
+              '.article-title',
+              '#js_article_title',
+              '#activity-name',
+              '.weui-msg__title',
+            ];
+            for (const sel of titleSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.title = el.textContent.trim();
+                break;
+              }
+            }
+
+            // WeChat author selectors
+            const authorSelectors = [
+              '#js_name',
+              '.profile_nickname',
+              '.rich_media_meta_nickname',
+              '#profileBt a',
+              '.account_nickname',
+              '.wx_follow_nickname',
+              '#js_name_container .rich_media_meta_nickname',
+            ];
+            for (const sel of authorSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.author = el.textContent.trim();
+                break;
+              }
+            }
+
+            // WeChat content selectors
+            const contentSelectors = [
+              '#js_content',
+              '.rich_media_content',
+              '#js_article_content',
+              '.article-content',
+              '#content',
+              '#img-content',
+              '.weui-msg__text-area',
+              '.rich_media_inner',
+            ];
+            for (const sel of contentSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim().length > 100) {
+                data.content = el.innerHTML;
+                data.textContent = el.textContent.trim();
+                break;
+              }
+            }
+
+            // WeChat publish time selectors
+            const timeSelectors = [
+              '#publish_time',
+              '.rich_media_meta_text',
+              '#js_publish_time',
+              '.article-date',
+              'em#publish_time',
+              '.publish_time',
+              '#post-date',
+              '.rich_media_meta_primary_text',
+            ];
+            for (const sel of timeSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.publishTime = el.textContent.trim();
+                break;
+              }
+            }
+
+            // WeChat source/original link
+            const sourceSelectors = [
+              '.rich_media_meta_link',
+              '#js_source_url',
+              '.original_link',
+              '#source_url',
+            ];
+            for (const sel of sourceSelectors) {
+              const el = document.querySelector(sel);
+              if (el) {
+                data.source = el.href || el.textContent.trim();
+                break;
+              }
+            }
+
+            // Fallback: extract from meta tags
+            if (!data.title) {
+              const metaTitle = document.querySelector('meta[property="og:title"], meta[name="title"]');
+              if (metaTitle) data.title = metaTitle.getAttribute('content');
+            }
+
+            // Fallback: extract author from text content if not found
+            if (!data.author && data.textContent) {
+              const lines = data.textContent.split('\n').filter(l => l.trim());
+              if (lines.length > 1) {
+                const secondLine = lines[1].trim();
+                if (secondLine.length < 50 && !secondLine.includes('：') && !secondLine.includes(':')) {
+                  data.author = secondLine;
+                }
+              }
+            }
+
+            // Fallback: extract publish time from text content
+            if (!data.publishTime && data.textContent) {
+              const datePatterns = [
+                /(\d{4}年\d{1,2}月\d{1,2}日)/,
+                /(\d{4}-\d{2}-\d{2})/,
+                /(\d{4}\/\d{2}\/\d{2})/,
+              ];
+              for (const pattern of datePatterns) {
+                const match = data.textContent.match(pattern);
+                if (match) {
+                  data.publishTime = match[1];
+                  break;
+                }
+              }
+            }
+
+            // If no content found, try body text
+            if (!data.textContent) {
+              const bodyText = document.body.innerText.trim();
+              if (bodyText.length > 200) {
+                data.textContent = bodyText;
+              }
+            }
+
+            return data;
+          });
+
+          const hasTitle = articleData.title && articleData.title.length > 0;
+          const hasContent = articleData.textContent && articleData.textContent.length > 100;
+          return {
+            articleData,
+            contentReady: hasTitle && hasContent,
+          };
+        },
+      });
+      return result;
+    },
+    log,
+  });
 }
 
 // ─── GENERIC ARTICLE FETCHER ────────────────────────────────────────────────────
@@ -1402,118 +2111,118 @@ async function fetchGenericArticle(articleUrl, opts = {}) {
   log('🚀 Launching Freeman Browser...');
   log(`🔗 URL: ${articleUrl}`);
 
-  const { browser, page } = await launchFreeman({ mobile: false, headless });
+  return withBrowser({
+    launchOpts: { mobile: false, headless },
+    work: async (page) => {
+      // Use shared retry wrapper for navigation + extraction
+      const result = await retryExtract({
+        log,
+        label: 'generic',
+        page,
+        retries: 2,
+        attemptFn: async ({ attempt, page }) => {
+          log('📡 Navigating to article...');
+          await smartNavigate(page, articleUrl, { timeout, waitUntil: 'auto' });
 
-  try {
-    await page.setViewportSize({ width: 1440, height: 900 });
+          // Wait for initial load
+          await sleep(3000 + attempt * 1000);
 
-    log('📡 Navigating to article...');
-    await page.goto(articleUrl, {
-      waitUntil: 'networkidle',
-      timeout: timeout,
-    });
+          // Check for slider captcha
+          log('🔍 Checking for slider captcha...');
+          const sliderDetected = await detectSliderCaptcha(page);
 
-    await sleep(3000);
+          if (sliderDetected) {
+            log('🚨 Slider captcha detected, attempting to solve...');
+            const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
+            if (!solved) {
+              log('❌ Failed to solve slider captcha');
+              try {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                await page.screenshot({ path: `generic_slider_failed_${timestamp}.png` });
+              } catch (_) {}
+              throw new Error('Slider captcha could not be solved');
+            }
+            log('✅ Slider captcha solved!');
+            await sleep(5000 + attempt * 1000);
+          }
 
-    // Check for slider captcha
-    log('🔍 Checking for slider captcha...');
-    const sliderDetected = await detectSliderCaptcha(page);
+          // Extract article data
+          log(`📄 [generic] Extracting article data (attempt ${attempt + 1})...`);
+          const articleData = await page.evaluate(() => {
+            const data = {
+              title: '',
+              author: '',
+              content: '',
+              textContent: '',
+              publishTime: '',
+              url: window.location.href,
+            };
 
-    if (sliderDetected) {
-      log('🚨 Slider captcha detected, attempting to solve...');
-      const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
-      if (!solved) {
-        log('❌ Failed to solve slider captcha');
-        try {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          await page.screenshot({ path: `generic_slider_failed_${timestamp}.png` });
-        } catch (_) {}
-        throw new Error('Slider captcha could not be solved');
-      }
-      log('✅ Slider captcha solved!');
-      await sleep(5000);
-    }
+            // Generic title selectors
+            const titleSelectors = [
+              'h1', 'h1.title', 'h1.article-title', '.article-title', '.post-title',
+              '[class*="title"]', '[class*="Title"]', 'meta[property="og:title"]',
+              'title'
+            ];
+            for (const sel of titleSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.title = sel === 'title' ? el.textContent.trim().split(/[-|–—]/)[0].trim() : el.textContent.trim();
+                break;
+              }
+            }
 
-    // Extract article data with generic selectors
-    log('📄 Extracting article data...');
-    const articleData = await page.evaluate(() => {
-      const data = {
-        title: '',
-        author: '',
-        content: '',
-        textContent: '',
-        publishTime: '',
-        url: window.location.href,
-      };
+            // Generic author selectors
+            const authorSelectors = [
+              '.author', '.author-name', '.byline', '[class*="author"]', '[class*="Author"]',
+              '[rel="author"]', '.entry-author',
+            ];
+            for (const sel of authorSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim()) {
+                data.author = el.textContent.trim();
+                break;
+              }
+            }
 
-      // Generic title selectors
-      const titleSelectors = [
-        'h1', 'h1.title', 'h1.article-title', '.article-title', '.post-title',
-        '[class*="title"]', '[class*="Title"]', 'meta[property="og:title"]'
-      ];
-      for (const sel of titleSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.title = el.textContent.trim();
-          break;
-        }
-      }
+            // Generic content selectors
+            const contentSelectors = [
+              'article', 'main', '.article-content', '.post-content', '.content',
+              '[class*="content"]', '[class*="Content"]', '.entry-content',
+              '[itemprop="articleBody"]', '.article-body', '.post-body',
+            ];
+            for (const sel of contentSelectors) {
+              const el = document.querySelector(sel);
+              if (el && el.textContent.trim().length > 100) {
+                data.content = el.innerHTML;
+                data.textContent = el.textContent.trim();
+                break;
+              }
+            }
 
-      // Generic author selectors
-      const authorSelectors = [
-        '.author', '.author-name', '.byline', '[class*="author"]', '[class*="Author"]'
-      ];
-      for (const sel of authorSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          data.author = el.textContent.trim();
-          break;
-        }
-      }
+            // Fallback: use body text
+            if (!data.textContent) {
+              const bodyText = document.body.innerText.trim();
+              if (bodyText.length > 200) {
+                data.textContent = bodyText;
+              }
+            }
 
-      // Generic content selectors
-      const contentSelectors = [
-        'article', 'main', '.article-content', '.post-content', '.content',
-        '[class*="content"]', '[class*="Content"]', '.entry-content'
-      ];
-      for (const sel of contentSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 100) {
-          data.content = el.innerHTML;
-          data.textContent = el.textContent.trim();
-          break;
-        }
-      }
+            return data;
+          });
 
-      // Fallback: use body text
-      if (!data.textContent) {
-        const bodyText = document.body.innerText.trim();
-        if (bodyText.length > 200) {
-          data.textContent = bodyText;
-        }
-      }
-
-      return data;
-    });
-
-    log('✅ Article extracted successfully');
-    log(`   Title: ${articleData.title?.slice(0, 50) || 'N/A'}${articleData.title?.length > 50 ? '...' : ''}`);
-    log(`   Author: ${articleData.author || 'N/A'}`);
-    log(`   Content length: ${articleData.textContent?.length || 0} chars`);
-
-    return {
-      success: true,
-      data: articleData,
-      url: articleUrl,
-    };
-
-  } catch (error) {
-    log('❌ Error fetching article:', error.message);
-    throw error;
-  } finally {
-    if (browser) await browser.close();
-    log('🔒 Browser closed');
-  }
+          const hasTitle = articleData.title && articleData.title.length > 0;
+          const hasContent = articleData.textContent && articleData.textContent.length > 100;
+          return {
+            articleData,
+            contentReady: hasTitle && hasContent,
+          };
+        },
+      });
+      return result;
+    },
+    log,
+  });
 }
 
 // ─── ACCESSIBILITY SNAPSHOT (inspired by agent-browser) ────────────────────────
@@ -1673,81 +2382,163 @@ async function readUrl(url, opts = {}) {
   if (url.includes('xueqiu.com')) platform = 'xueqiu';
   else if (url.includes('mp.weixin.qq.com')) platform = 'wechat';
 
-  const { browser, page } = await launchFreeman({ mobile: false, headless });
-
-  try {
-    await page.setViewportSize({ width: 1440, height: 900 });
-
-    await page.goto(url, { waitUntil: 'networkidle', timeout });
-    await sleep(3000);
-
-    // Handle slider captcha
-    const sliderDetected = await detectSliderCaptcha(page);
-    if (sliderDetected) {
-      log('Slider captcha detected, solving...');
-      await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
-      await sleep(5000);
-    }
-
-    // Extract content using platform-specific selectors
-    const data = await page.evaluate((fmt) => {
-      const result = { title: '', author: '', content: '', publishTime: '' };
-
-      // Title
-      const titleSels = ['#activity_name', '.rich_media_title', 'h1.article-title',
-        '.article__title', 'h1.title', 'h1', 'title'];
-      for (const s of titleSels) {
-        const el = document.querySelector(s);
-        if (el && el.textContent.trim()) { result.title = el.textContent.trim(); break; }
+  // Platform-specific init scripts
+  const initScripts = [];
+  if (platform === 'wechat') {
+    initScripts.push(() => {
+      Object.defineProperty(window.navigator, 'appVersion', { get: () => '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' });
+      if (window.chrome) {
+        Object.defineProperty(window.chrome, 'csi', { get: () => () => ({startE: 0, onloadT: Date.now(), transition: 0}) });
+        Object.defineProperty(window.chrome, 'loadTimes', { get: () => () => ({requestTime: Date.now()/1000 - 1, startLoadTime: Date.now()/1000 - 1, commitLoadTime: Date.now()/1000 - 0.5, finishDocumentLoadTime: Date.now()/1000 - 0.3, finishLoadTime: Date.now()/1000 - 0.2, firstPaintTime: Date.now()/1000 - 0.4, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: false, wasNpnNegotiated: false, npnNegotiatedProtocol: '', }) });
       }
-
-      // Author
-      const authorSels = ['#js_name', '.profile_nickname', '.rich_media_meta_nickname',
-        '.author-name', '.author', '[class*="author"]'];
-      for (const s of authorSels) {
-        const el = document.querySelector(s);
-        if (el && el.textContent.trim()) { result.author = el.textContent.trim(); break; }
+      Object.defineProperty(document, 'hidden', { get: () => false });
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+      if (document.hasFocus) document.hasFocus = () => true;
+      if (performance.timing) {
+        const now = Date.now();
+        performance.timing = {
+          ...performance.timing,
+          navigationStart: now - 5000, unloadEventStart: now - 4000, unloadEventEnd: now - 3800,
+          redirectStart: now - 3700, redirectEnd: now - 3600, fetchStart: now - 3500,
+          domainLookupStart: now - 3400, domainLookupEnd: now - 3200, connectStart: now - 3100,
+          connectEnd: now - 2800, requestStart: now - 2700, responseStart: now - 1500,
+          responseEnd: now - 1000, domLoading: now - 900, domInteractive: now - 500,
+          domContentLoadedEventStart: now - 400, domContentLoadedEventEnd: now - 300,
+          domComplete: now - 100, loadEventStart: now - 50, loadEventEnd: now,
+        };
       }
-
-      // Content
-      const contentSels = ['#js_content', '.rich_media_content', 'article.article__bd',
-        '.article__content', '.article-content', 'article', 'main', '.content'];
-      for (const s of contentSels) {
-        const el = document.querySelector(s);
-        if (el && el.textContent.trim().length > 100) {
-          result.content = fmt === 'html' ? el.innerHTML : el.innerText.trim();
-          break;
-        }
+      const originalFetch = window.fetch;
+      window.fetch = function(...args) {
+        const u = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+        if (u.includes('res.wx.qq.com') || u.includes('mmbiz.qpic.cn') || u.includes('mp.weixin.qq.com')) return originalFetch.apply(this, args);
+        if (u.includes('trace') || u.includes('log') || u.includes('beacon')) return new Response(null, { status: 200 });
+        return originalFetch.apply(this, args);
+      };
+    });
+  } else if (platform === 'xueqiu') {
+    initScripts.push(() => {
+      const originalRTCPeerConnection = window.RTCPeerConnection;
+      if (originalRTCPeerConnection) {
+        window.RTCPeerConnection = function(...args) {
+          const pc = new originalRTCPeerConnection(...args);
+          const originalCreateDataChannel = pc.createDataChannel.bind(pc);
+          pc.createDataChannel = function(...dcArgs) { return originalCreateDataChannel(...dcArgs); };
+          return pc;
+        };
       }
-
-      // Publish time
-      const timeSels = ['#publish_time', '.rich_media_meta_text', '.article-time',
-        '.publish-time', 'time', '[class*="time"]'];
-      for (const s of timeSels) {
-        const el = document.querySelector(s);
-        if (el && el.textContent.trim()) { result.publishTime = el.textContent.trim(); break; }
-      }
-
-      // Fallback content
-      if (!result.content) {
-        const body = document.body.innerText.trim();
-        if (body.length > 200) result.content = body;
-      }
-
-      return result;
-    }, format);
-
-    return {
-      title: data.title,
-      author: data.author,
-      content: data.content,
-      publishTime: data.publishTime,
-      url,
-      platform,
-    };
-  } finally {
-    await browser.close();
+    });
   }
+
+  return withBrowser({
+    launchOpts: { mobile: false, headless },
+    initScripts,
+    work: async (page) => {
+      const result = await retryExtract({
+        log,
+        label: 'read',
+        page,
+        retries: 2,
+        attemptFn: async ({ attempt, page }) => {
+          log('📡 Navigating to article...');
+          await smartNavigate(page, url, { timeout, waitUntil: 'auto' });
+
+          await sleep(3000 + attempt * 1000);
+
+          // Handle slider captcha
+          log('🔍 Checking for slider captcha...');
+          const sliderDetected = await detectSliderCaptcha(page);
+          if (sliderDetected) {
+            log('🚨 Slider captcha detected, solving...');
+            const solved = await solveSliderCaptcha(page, { verbose, maxRetries: 3 });
+            if (!solved) throw new Error('Slider captcha could not be solved');
+            log('✅ Slider captcha solved!');
+            await sleep(5000 + attempt * 1000);
+          }
+
+          // Extract content
+          log('📄 Extracting content...');
+          const data = await page.evaluate(({ fmt, plat }) => {
+            const result = { title: '', author: '', content: '', publishTime: '' };
+
+            // Title
+            const titleSels = plat === 'wechat'
+              ? ['#activity_name', '.rich_media_title', 'h2.rich_media_title', 'h1', '.article-title', '#js_article_title']
+              : plat === 'xueqiu'
+                ? ['h1.article-title', 'h1.title', '.article-title h1', '.article__title', '.article-title', 'h1', '.title']
+                : ['h1', 'h1.title', 'h1.article-title', '.article-title', '.post-title', '[class*="title"]', 'title'];
+            for (const s of titleSels) {
+              const el = document.querySelector(s);
+              if (el && el.textContent.trim()) { result.title = el.textContent.trim(); break; }
+            }
+
+            // Author
+            const authorSels = plat === 'wechat'
+              ? ['#js_name', '.profile_nickname', '.rich_media_meta_nickname', '#profileBt a']
+              : plat === 'xueqiu'
+                ? ['.author-name', '.article-author', '.user-name', '.author', '.status-user-name', '.user-info .name']
+                : ['.author', '.author-name', '.byline', '[class*="author"]'];
+            for (const s of authorSels) {
+              const el = document.querySelector(s);
+              if (el && el.textContent.trim()) { result.author = el.textContent.trim(); break; }
+            }
+
+            // Content
+            const contentSels = plat === 'wechat'
+              ? ['#js_content', '.rich_media_content', '#js_article_content', '.article-content']
+              : plat === 'xueqiu'
+                ? ['article.article__bd', '.article__bd', '.article__bd__detail', '.article-content', 'article']
+                : ['article', 'main', '.article-content', '.post-content', '.content', '[class*="content"]'];
+            for (const s of contentSels) {
+              const el = document.querySelector(s);
+              if (el && el.textContent.trim().length > 100) {
+                result.content = fmt === 'html' ? el.innerHTML : el.innerText.trim();
+                break;
+              }
+            }
+
+            // Publish time
+            const timeSels = plat === 'wechat'
+              ? ['#publish_time', '.rich_media_meta_text', '#js_publish_time', '.article-date']
+              : plat === 'xueqiu'
+                ? ['.article-time', '.publish-time', '.time', '.status-time', '.article__time']
+                : ['.article-time', '.publish-time', 'time', '[class*="time"]'];
+            for (const s of timeSels) {
+              const el = document.querySelector(s);
+              if (el && el.textContent.trim()) { result.publishTime = el.textContent.trim(); break; }
+            }
+
+            // Fallback content
+            if (!result.content) {
+              const body = document.body.innerText.trim();
+              if (body.length > 200) result.content = body;
+            }
+
+            return result;
+          }, { fmt: format, plat: platform });
+
+          const hasTitle = data.title && data.title.length > 0;
+          const hasContent = data.content && data.content.length > 100;
+          return {
+            articleData: data,
+            contentReady: hasTitle && hasContent,
+          };
+        },
+      });
+
+      if (result.success) {
+        return {
+          title: result.data.title,
+          author: result.data.author,
+          content: result.data.content,
+          publishTime: result.data.publishTime,
+          url,
+          platform,
+        };
+      }
+      throw new Error('Failed to extract article');
+    },
+    log,
+  });
 }
 
 // ─── SESSION PERSISTENCE (inspired by agent-browser profiles) ──────────────────
@@ -2103,6 +2894,7 @@ module.exports = {
   launchFreeman,
   humanClick, humanMouseMove, humanType, humanScroll, humanRead,
   solveCaptcha, detectSliderCaptcha, solveSliderCaptcha, handleSliderCaptcha,
+  smartNavigate,
   fetchXueqiuArticle, fetchWechatArticle, fetchArticle, fetchGenericArticle,
   shadowQuery, shadowFill, shadowClickButton, dumpInteractiveElements,
   pasteIntoEditor,

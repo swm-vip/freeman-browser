@@ -1,6 +1,7 @@
-# 🕵️ Freeman Browser
+# 🕵️ Freeman Browser (v2.0)
 
 > Stealth browser for AI agents. Bypass anti-bot detection with human-like fingerprints.
+> Optimized for Xueqiu (雪球) and WeChat (微信公众号).
 
 Freeman Browser 是一个基于 Playwright 的隐身浏览器，专为 AI Agent 设计。它让自动化脚本看起来像一个真实的用户在浏览网页，从而绕过 Cloudflare、DataDome 等反爬检测系统。
 
@@ -10,28 +11,37 @@ Freeman Browser 是一个基于 Playwright 的隐身浏览器，专为 AI Agent 
 
 - 🎭 **双模式指纹伪装** — iPhone 15 Pro (Safari) 或 Desktop Chrome，一键切换
 - 🖱️ **人类行为模拟** — 贝塞尔曲线鼠标轨迹、随机打字延迟、自然滚动、阅读停顿
-- 🧩 **滑块验证码自动识别与破解** — 支持阿里/雪球、极验(GeeTest)、通用滑块
+- 🧩 **滑块验证码自动识别与破解** — 支持阿里/雪球、极验(GeeTest)、通用滑块（误判率极低）
 - 🔑 **2CAPTCHA 集成** — 自动解决 reCAPTCHA v2/v3、hCaptcha、Cloudflare Turnstile
 - 🌑 **Shadow DOM 穿透** — 深度遍历 Web Components，定位表单元素
-- ✏️ **富文本编辑器支持** — 剪贴板粘贴方式，兼容 Lexical、ProseMirror、Quill、Draft.js
+- ✏️ **富文本编辑器支持** — 剪贴板粘贴方式，兼容 Lexical、ProseMirror, Quill, Draft.js
 - 📰 **文章抓取** — 雪球、微信公众号、通用网页，自动处理验证码
-- 🛡️ **反检测措施** — Canvas/WebGL 指纹噪声、WebRTC 防泄漏、Client Hints 伪装
+  - 雪球：API 直连优先（`statuses/original/show.json`），15+ 自适应选择器
+  - 微信：环境检测绕过，10+ 自适应选择器，日期正则提取
+- 🛡️ **反检测措施 v2.0**：
+  - 60+ Chromium 启动参数（禁用自动化特征）
+  - DNS-over-HTTPS 防止 DNS 泄漏
+  - 50+ 广告/追踪域名自动拦截
+  - Canvas/WebGL 指纹噪声
+  - WebRTC 防泄漏
+  - 性能计时噪声 + 电池/媒体设备伪装
+  - 完整的 Client Hints + Sec-Fetch 头部
+- 🔄 **智能导航** — `smartNavigate()` 内置重试 + 验证码自动处理
+- 🖥️ **CLI + Daemon** — 持久化浏览器守护进程，零启动开销
 
 ---
 
 ## 📦 安装
 
 ```bash
-# 克隆仓库
-git clone https://github.com/swm-vip/freeman-browser.git
-cd freeman-browser
-
 # 安装依赖
 npm install
 
 # 安装 Playwright 浏览器
 npx playwright install chromium
 ```
+
+**Node.js >= 18.0.0**  required。
 
 ---
 
@@ -50,11 +60,32 @@ const { browser, page } = await launchFreeman({ mobile: false });
 await page.goto('https://any-protected-site.com');
 ```
 
+### 雪球文章抓取
+
+```js
+const { fetchXueqiuArticle } = require('./scripts/browser-freeman');
+
+const result = await fetchXueqiuArticle('https://xueqiu.com/123456/789012');
+console.log(result.data.title);
+console.log(result.data.textContent);
+```
+
+### 微信公众号抓取
+
+```js
+const { fetchWechatArticle } = require('./scripts/browser-freeman');
+
+const article = await fetchWechatArticle('https://mp.weixin.qq.com/s/xxxxx');
+console.log(article.data.title);
+console.log(article.data.author);
+```
+
 ---
 
 ## 🎭 指纹伪装详情
 
 ### Mobile 模式（默认）
+
 | 属性 | 伪装值 |
 |------|--------|
 | User-Agent | iPhone 15 Pro, iOS 17.4.1, Safari |
@@ -65,6 +96,7 @@ await page.goto('https://any-protected-site.com');
 | Client Hints | sec-ch-ua-mobile: ?1, platform: iOS |
 
 ### Desktop 模式
+
 | 属性 | 伪装值 |
 |------|--------|
 | User-Agent | Chrome/136.0.0.0, Windows 10 |
@@ -74,14 +106,20 @@ await page.goto('https://any-protected-site.com');
 | Client Hints | sec-ch-ua, sec-ch-ua-mobile: ?0, platform: Windows |
 
 ### 反检测措施
+
 - ✅ `navigator.webdriver` → `false`
-- ✅ Canvas 指纹噪声（LSB 翻转 + fillText 微位移）
+- ✅ Canvas 指纹噪声（LSB 翻转 + fillText 微位移 + getImageData 噪声）
 - ✅ WebGL 指纹伪装（Intel Iris OpenGL Engine）
 - ✅ `navigator.plugins` / `mimeTypes` 伪装
 - ✅ `screen` 属性与 viewport 匹配
 - ✅ `navigator.connection` 伪装
-- ✅ HTTP Client Hints 头部完整设置
-- ✅ TLS 指纹 — 使用真实 Chromium 二进制
+- ✅ HTTP Client Hints + Sec-Fetch 头部完整设置
+- ✅ 60+ Chromium 启动参数禁用自动化特征
+- ✅ DNS-over-HTTPS 防止 DNS 泄漏
+- ✅ 50+ 广告/追踪域名自动拦截
+- ✅ WebRTC 防泄漏
+- ✅ 性能计时噪声 + 电池/媒体设备伪装
+- ✅ `appCodeName` / `appName` / `product` 伪装
 
 ---
 
@@ -128,6 +166,7 @@ await handleSliderCaptcha(page, { timeout: 10000 });
 - 阿里/雪球（nc_container）
 - 极验 GeeTest
 - 通用滑块（自动识别宽条形元素）
+- 智能降误判：结合光标样式、尺寸、背景色、圆角、overflow 综合判断
 
 ---
 
@@ -210,6 +249,7 @@ const wechat = await fetchWechatArticle(url);
 ```
 
 返回数据结构：
+
 ```js
 {
   success: true,
@@ -239,6 +279,12 @@ const wechat = await fetchWechatArticle(url);
     "latitude": 31.2304,
     "longitude": 121.4737,
     "accuracy": 50
+  },
+  "proxy": {
+    "server": "http://proxy.example.com:8080",
+    "bypass": ["localhost", "127.0.0.1"],
+    "username": "user",
+    "password": "pass"
   }
 }
 ```
@@ -251,10 +297,13 @@ const wechat = await fetchWechatArticle(url);
 
 ```bash
 # 基础连接测试（IP 信息）
-node scripts/browser-freeman.js
+node scripts/browser-freeman.js https://ipinfo.io/json
 
 # 测试雪球文章抓取
 node scripts/browser-freeman.js https://xueqiu.com/123456/789012
+
+# 启动 daemon
+node scripts/browser-freeman-cli.js daemon --headless
 ```
 
 ---
@@ -269,7 +318,8 @@ freeman-browser/
 ├── package.json                # 依赖声明
 ├── enable_models.js            # 示例：自动化模型启用脚本
 └── scripts/
-    └── browser-freeman.js      # 🔧 核心引擎（~1500 行）
+    ├── browser-freeman.js      # 🔧 核心引擎（~2600 行）
+    └── browser-freeman-cli.js  # 🖥️ CLI 入口（~700 行）
 ```
 
 ---
